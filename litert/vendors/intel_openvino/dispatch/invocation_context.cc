@@ -504,15 +504,27 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
                                      ? scheduling_info->original_uid
                                      : static_cast<int32_t>(getuid());
 
-    // Best-effort: some OpenVINO/NPU driver versions expose MODEL_PRIORITY as
-    // read-only on a compiled model. If it can't be set, ignore and continue.
-    try {
-      auto compiled_model = infer_request_.get_compiled_model();
-      compiled_model.set_property(ov::hint::model_priority(
-          litert::openvino::ToOvModelPriority(job_priority)));
-    } catch (const std::exception& e) {
-      LITERT_LOG(LITERT_WARNING,
-                 "NPU HAL model priority not applied, ignoring: %s", e.what());
+    // NPU Manager owns this process's priority and updates it on
+    // foreground/background transitions, so the HAL is the source of truth for
+    // the command queue rather than whatever the caller passed at attach time.
+    const int32_t hal_priority = litert::openvino::CurrentHalPriority();
+    const ov::hint::Priority ov_priority =
+        litert::openvino::ToOvModelPriority(hal_priority);
+    if (ov_priority != applied_model_priority_) {
+      // The plugin recreates the command queue at the new priority; the next
+      // inference picks it up. Best-effort so a plugin that rejects the
+      // property does not fail the invoke.
+      try {
+        auto compiled_model = infer_request_.get_compiled_model();
+        compiled_model.set_property(ov::hint::model_priority(ov_priority));
+        applied_model_priority_ = ov_priority;
+      } catch (const std::exception& e) {
+        LITERT_LOG(LITERT_WARNING,
+                   "NPU HAL model priority not applied, ignoring: %s",
+                   e.what());
+        // Remember it anyway so a failing plugin is not retried every inference.
+        applied_model_priority_ = ov_priority;
+      }
     }
 
     auto wrapper = std::make_unique<ov_infer_request_wrapper>();
